@@ -1,0 +1,196 @@
+#! /usr/bin/env python3
+
+import os
+import sys
+import pathlib
+import re
+import time
+import shlex
+
+ERR_NOT_ENOUGH_ARGUMENTS = -1
+ERR_NO_INPUT_FILE = -2
+ERR_LENGTH_IS_NOT_NUMERIC = -3
+ERR_STARTING_POINT_NOT_PROVIDED = -4
+ERR_INVALID_STARTING_OR_ENDING_POINT = -5
+ERR_TIME_TO_NUM = -6
+ERR_UNEXPECTED = -10
+
+def usage(exitCode):
+    print('ffcut: simple wrapper around ffmpeg to make it easy to cut movies')
+    print('---')
+    print('usage 1: ffcut inputFile length [startingPoint] [countPrefix]')
+    print('usage 2: ffcut inputFile startingPoint endingPoint [countPrefix]')
+    print('---')
+    print('inputFile: relative or absolute path of the file to cut')
+    print('length: length as number of seconds (no default)')
+    print('startingPoint: time of first frame to include. Time expected (00:00:00.0 by default)')
+    print('endingPoint: time of first frame not to include. Time format expected (no default)')
+    print('countPrefix: expression to use before the count part of the output. ("cut" by default)')
+    print('exit %d' % (exitCode))
+    exit(exitCode)
+
+numberRegex = re.compile('^(\d+)(\.\d)?$')
+timeRegex = re.compile('^([0-2]?\d:)?([0-5]?\d:)?([0-5]?\d)(\.\d)?$')
+
+def is_numeric(val):
+    "is_numeric returns True if the given value is parsable as a numeric value"
+
+    return numberRegex.match(val)
+
+def is_time(val):
+    "is_time returns True if the given value is parsable as a formatted time value"
+
+    return timeRegex.match(val)
+
+def time_to_num(val):
+    "time_to_num converts a time value formatted as time into a decimal of seconds (eg. 01:00:12.2 -> 3612.2)"
+
+    matches = timeRegex.findall(val)
+
+    if len(matches) != 1:
+        usage(ERR_TIME_TO_NUM)
+
+    m = matches[0]
+    m0, m1, m2, m3 = m[0], m[1], m[2], m[3]
+
+    if m1 == '' and not m0 == '':
+        m1 = m0
+        m0 = '00:'
+
+    whole = 0
+    if m0 != '':
+        whole += ( int(m0.rjust(3, '0')[0:2]) * 3600 )
+
+    if m1 != '':
+        whole += ( int(m1.rjust(3, '0')[0:2]) * 60 )
+
+    if m2 != '':
+        whole += ( int(m2.rjust(2, '0')) )
+
+    return '%d%s' % (whole, m3)
+
+def num_diff(startingTime, endingTime):
+    "num_diff receives a startingTime and endingTime in numberic format and calculates the difference"
+
+    if float(startingTime) > float(endingTime):
+        usage(ERR_INVALID_STARTING_OR_ENDING_POINT)
+
+    starting = numberRegex.findall(startingTime)
+    ending = numberRegex.findall(endingTime)
+
+    if len(starting) == 0 or len(ending) == 0:
+        usage(ERR_INVALID_STARTING_OR_ENDING_POINT)
+
+    whole = int(ending[0][0]) - int(starting[0][0])
+
+    if starting[0][1] == '' and ending[0][1] == '':
+        return '%d' % (whole)
+
+    s = 0 if starting[0][1] == '' else int(starting[0][1][1:])
+    e = 0 if ending[0][1] == '' else int(ending[0][1][1:])
+
+    tenth = e - s
+
+    if tenth >= 0:
+        return "%d.%d" % (whole, tenth)
+
+    return "%d.%d" % (whole - 1, tenth + 10)
+
+def num_to_time(whole, tenth):
+    if whole > 216000:
+        whole = 215999
+
+    sec = '%d' % (whole % 60)
+    min = '%d' % ((whole % 3600) / 60)
+    hour = '%d' % ((whole % 216000) / 3600)
+
+    return '%s:%s:%s%s' % (hour.rjust(2, '0'), min.rjust(2, '0'), sec.rjust(2, '0'), tenth)
+
+def create_output_name(path, fileCount, countPrefix):
+    return '%s-%s%s%s' % (path.stem, fileCount, countPrefix, path.suffix)
+
+def create_length_usage1():
+    length = sys.argv[2]
+
+    if not is_numeric(length):
+        usage(ERR_LENGTH_IS_NOT_NUMERIC)
+
+    return length
+
+def create_length_usage2():
+    starting_time = time_to_num(sys.argv[2])
+    ending_time   = time_to_num(sys.argv[3])
+
+    return num_diff(starting_time, ending_time)
+
+def create_starting_point_usage1():
+    if len(sys.argv) < 4:
+        return '00:00:00.0'
+
+    return create_starting_point(sys.argv[3])
+
+def create_starting_point_usage2():
+    if len(sys.argv) < 3:
+        usage(ERR_STARTING_POINT_NOT_PROVIDED)
+
+    return create_starting_point(sys.argv[2])
+
+def create_starting_point(val):
+    t = time_to_num(val)
+
+    matches = numberRegex.findall(t)
+
+    if len(matches) != 1:
+        usage(ERR_UNEXPECTED)
+
+    m = matches[0]
+
+    return num_to_time(int(m[0]), m[1])
+
+def create_count_prefix():
+    if len(sys.argv) > 4:
+        return sys.argv[4]
+
+    return 'cut'
+
+def create_file_count(inputPath, countPrefix):
+    fileCount = 1
+    while os.path.exists(create_output_name(inputPath, fileCount, countPrefix)):
+        fileCount += 1
+
+    return fileCount
+
+def create_output_path(inputPath, fileCount, countPrefix):
+    return inputPath.with_name(create_output_name(inputPath, fileCount, countPrefix))
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] == '-h' or sys.argv[1] == '--help':
+        usage(ERR_NOT_ENOUGH_ARGUMENTS)
+
+    inputPath = pathlib.Path(sys.argv[1]).resolve()
+
+    if not inputPath.exists() or not inputPath.is_file():
+        print('inputFile does not exist or not a file: %s' % (inputPath))
+        usage(ERR_NO_INPUT_FILE)
+
+    countPrefix = create_count_prefix()
+    fileCount = create_file_count(inputPath, countPrefix)
+    outputPath = create_output_path(inputPath, fileCount, countPrefix)
+
+    if is_numeric(sys.argv[2]):
+        length = create_length_usage1()
+        startingTime = create_starting_point_usage1()
+    else:
+        length = create_length_usage2()
+        startingTime = create_starting_point_usage2()
+
+    safeInputPath = '{}'.format(shlex.quote('%s' % inputPath))
+    safeOutputPath = '{}'.format(shlex.quote('%s' % outputPath))
+    cmd = 'ffmpeg -ss %s -i %s -c copy -t %s %s' % (startingTime, safeInputPath, length, safeOutputPath)
+
+    print(cmd)
+
+    os.system(cmd)
+
+main()
+
